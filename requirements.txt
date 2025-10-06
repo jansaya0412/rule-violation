@@ -1,0 +1,24 @@
+black
+flake8
+isort
+pip
+python-dotenv
+-e .
+
+pandas~=2.2.3
+tqdm~=4.67.1
+evaluate~=0.4.3
+datasets~=3.2.0
+transformers~=4.47.0
+scipy~=1.14.1
+scikit-learn~=1.6.0
+numpy~=2.2.0
+packaging~=24.2
+setuptools~=68.2.0
+requests~=2.32.3
+beautifulsoup4~=4.12.3
+ollama~=0.4.4
+peft~=0.14.0
+ray~=2.40.0
+jupyter
+markdown
