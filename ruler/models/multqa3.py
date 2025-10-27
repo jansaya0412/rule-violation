@@ -6,11 +6,15 @@ import string
 import os
 import tqdm
 import pandas as pd
+import itertools
+import random
+import numpy as np
 
 from functools import partial
 
 from torch.utils.data import DataLoader
 from transformers import AutoModelForMultipleChoice, AutoTokenizer
+from transformers import get_linear_schedule_with_warmup
 from sklearn.metrics import classification_report, confusion_matrix, f1_score, accuracy_score
 
 from ruler.features.make_splits import read_split
@@ -33,6 +37,14 @@ class MultipleChoiceDataset(torch.utils.data.Dataset):
 
         # data_to_qa:
         comment = entry['content']
+        comm = entry.get("community", {})
+        comm_name = comm.get("name", "")
+
+        if self.custom_tokens:
+            header = f"[BOC]\n{comm_name}\n[EOC]"
+        else:
+            header = f"Community: {comm_name}"
+
         rules = "[BOR]\n" if self.custom_tokens else ""
         for rule_n, rule_text in entry['community']['rules']:
             rules += format_rule(rule_n, rule_text, custom_rule_tokens=self.custom_rule_tokens) + "\n"
@@ -43,13 +55,13 @@ class MultipleChoiceDataset(torch.utils.data.Dataset):
         choices = []
         for letter, _ in entry['community']['rules']:
             if self.custom_tokens:
-                context = f"{rules}\n[ANSWER]\nRule {letter}"
+                context = f"{header}{rules}\n[ANSWER]\nRule {letter}"
             else:
-                context = f"{rules}\nAnswer: Rule {letter}"
+                context = f"{header}{rules}\nAnswer: Rule {letter}"
             choices.append(context)
 
         if len(choices) < self.max_choices:
-            pad_choice = "[BOR]\n[EOR]\n[ANSWER]\n[PAD_RULE]"
+            pad_choice = "[BOC]\n[EOC]\n[BOR]\n[EOR]\n[ANSWER]\n[PAD_RULE]"
             choices += [pad_choice] * (self.max_choices - len(choices))
 
         label = entry.get("applied_rule_n", None)
@@ -78,8 +90,7 @@ class MultipleChoiceDataset(torch.utils.data.Dataset):
 
         if "token_type_ids" in enc:
             item["token_type_ids"] = enc["token_type_ids"]
-        
-        print(item)
+            
         return item
 
 
@@ -119,7 +130,7 @@ def format_rule(rule_n, rule_text, custom_rule_tokens=False):
             #if false, then ('B', 'Be civil') → "B. Be civil"
     return to_return
 
-def train_step(gradient_acc_step, grads, device, model, optimizer, loss_fn , train_loader, epoch):
+def train_step(gradient_acc_step, grads, device, model, optimizer, scheduler, loss_fn , train_loader, epoch):
     model.train()
     train_loss = 0
     steps = 0
@@ -149,6 +160,7 @@ def train_step(gradient_acc_step, grads, device, model, optimizer, loss_fn , tra
             grads = gradfilter_ema(model, grads=grads) if grads is not None else gradfilter_ema(model, grads=None)
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
+            scheduler.step()
             optimizer.zero_grad(set_to_none=True)
 
 
@@ -168,9 +180,9 @@ def print_classification_metrics(labels, preds):
     confusion = confusion_matrix(y_true=labels, y_pred=preds)
     print(confusion)
 
-    return accuracy, f1
+    return accuracy, f1, confusion
 
-def eval_step(model, dataset, device, epoch, loss_fn, test_name, batch_size=16):
+def eval_step(model, dataset, device, epoch, loss_fn, test_name, batch_size=16, lr=5e-6, wd=0.01):
     eval_loader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
     model = model.to(device)
     model.eval()
@@ -178,7 +190,8 @@ def eval_step(model, dataset, device, epoch, loss_fn, test_name, batch_size=16):
     preds = list()
     labels = list()
 
-    evaluation_folder = '../../reports/evaluation/'
+    evaluation_folder = '/content/drive/MyDrive/rule-violation-main/reports/evaluation'
+    #evaluation_folder = '../../reports/evaluation/'
     os.makedirs(evaluation_folder, exist_ok=True)
 
     for batch in eval_loader:
@@ -203,19 +216,22 @@ def eval_step(model, dataset, device, epoch, loss_fn, test_name, batch_size=16):
             labels.extend(batch['labels'].tolist())
             preds.extend(final_logit.tolist())
 
-    accuracy, f1 = print_classification_metrics(labels, preds)
+    accuracy, f1, confusion = print_classification_metrics(labels, preds)
     avg_loss = loss_value / len(eval_loader)
     print(f"Eval loss: {avg_loss}")
 
     row_metrics = pd.DataFrame([{
         "epoch" : epoch,
+        "lr": lr, 
+        "wd": wd,
         "test_name" : test_name,
         "accuracy": accuracy,
         "f1": f1,
         "loss": avg_loss
     }])
+    pd.DataFrame(confusion).to_csv(os.path.join(evaluation_folder, f"confmat_{test_name}_e{epoch}_lr{lr}_wd{wd}.csv"), index=False)
 
-    results_path = os.path.join(evaluation_folder, "results2_log.csv")
+    results_path = os.path.join(evaluation_folder, "results3_log.csv")
     if os.path.exists(results_path):
         df_existing = pd.read_csv(results_path)
         df_all = pd.concat([df_existing, row_metrics], ignore_index=True)
@@ -228,7 +244,8 @@ def eval_step(model, dataset, device, epoch, loss_fn, test_name, batch_size=16):
     return labels, preds
 
 def save_results(labels, preds, fname='bertqa.json'):
-    results_folder = '../../reports/results/'
+    #results_folder = '../../reports/results/'
+    results_folder = '/content/drive/MyDrive/rule-violation-main/reports/results'
     os.makedirs(results_folder, exist_ok=True)
     with open(os.path.join(results_folder, fname), 'w+') as f:
         json.dump({'labels': labels, 'preds': preds}, f)
@@ -243,6 +260,14 @@ custom_rule_tokens = True
 batch_size = 4
 n_replicas_per_strategy = 1
 n_epochs = 10
+lr = 1e-5
+wd = 5e-4
+
+seed = 42
+random.seed(seed)
+np.random.seed(seed)
+torch.manual_seed(seed)
+torch.cuda.manual_seed_all(seed)
 
 train, test_stratified, test_n_rules_out, test_n_communities_out = map(prep_for_qa, read_split(task="nonbinary", split_n=0))
 all_data = train + test_stratified + test_n_rules_out + test_n_communities_out
@@ -294,7 +319,28 @@ for test_name, test_set in (('test_stratified', test_stratified), ('test_n_rules
 
     test_sets[test_name] = dataset
 
-optimizer = torch.optim.AdamW(model.parameters(), lr=5e-6, weight_decay=0.01)
+no_decay = ["bias", "LayerNorm.weight", "LayerNorm.bias"]
+param_groups = [
+    {
+        "params": [p for n,p in model.named_parameters() if not any(nd in n for nd in no_decay)],
+        "weight_decay": wd
+    },
+    {
+        "params": [p for n,p in model.named_parameters() if any(nd in n for nd in no_decay)],
+        "weight_decay": 0.0
+    },
+]
+
+#optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=wd)
+optimizer = torch.optim.AdamW(param_groups, lr=lr)
+
+num_training_steps = len(train_loader) * n_epochs
+num_warmup_steps = int(0.1 * num_training_steps)
+scheduler = get_linear_schedule_with_warmup(
+    optimizer,
+    num_warmup_steps=num_warmup_steps,
+    num_training_steps=num_training_steps
+)
 loss_fn = torch.nn.CrossEntropyLoss()
 
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -303,12 +349,13 @@ model = model.to(device)
 gradient_acc_step = 1
 grads = None 
 
-model_save_dir = "../../models/huggingface"
+model_save_dir = '/content/drive/MyDrive/rule-violation-main/models/huggingface'
+#model_save_dir = "../../models/huggingface"
 os.makedirs(model_save_dir, exist_ok=True)
 
 for epoch in range(n_epochs):
-    grads = train_step(gradient_acc_step, grads, device, model, optimizer,loss_fn, train_loader, epoch)
-    model_path = os.path.join(model_save_dir, f'{model_name}qa_onsplit_{epoch}')
+    grads = train_step(gradient_acc_step, grads, device, model, optimizer, scheduler, loss_fn, train_loader, epoch)
+    model_path = os.path.join(model_save_dir, f'{model_name}_lr{lr}_wd{wd}_epoch{epoch}')
     model.save_pretrained(model_path)
     torch.save(optimizer.state_dict(), os.path.join(model_path, "optimizer.pt"))
     
@@ -316,8 +363,8 @@ for epoch in range(n_epochs):
         print(f"testing {test_name}, len: {len(test_set)}")
         labels, preds = eval_step(
             model, test_set, device,
-            epoch, loss_fn, test_name, batch_size
+            epoch, loss_fn, test_name, batch_size, lr = lr, wd = wd
         )
-        save_results(labels, preds, fname=f'{model_name}qa_{test_name}_{epoch}.json')
+        save_results(labels, preds, fname=f'{model_name}_{test_name}_lr{lr}_wd{wd}_epoch{epoch}.json')
 
 
