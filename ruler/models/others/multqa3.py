@@ -6,7 +6,6 @@ import string
 import os
 import tqdm
 import pandas as pd
-import itertools
 import random
 import numpy as np
 

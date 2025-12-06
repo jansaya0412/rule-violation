@@ -48,7 +48,7 @@ def shuffled_rules(entry, only_unsafe):
     else:
         unsafe_rules = entry['community']['rules'][1:]
         random.shuffle(unsafe_rules)
-        entry['community']['rules'] = [entry['community']['rules'][0]] + unsafe_rules
+    entry['community']['rules'] = [entry['community']['rules'][0]] + unsafe_rules
     return entry
 
 def permutated_numbers(entry, only_unsafe):
